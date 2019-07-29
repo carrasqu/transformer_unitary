@@ -305,6 +305,10 @@ def create_masks( tar):
   return combined_mask 
 
 
+Nqubits = int(sys.argv[1])
+
+Ndataset = int(sys.argv[2])
+
 
 
 num_layers = 2 #4
@@ -319,7 +323,7 @@ target_vocab_size = 4 # number of measurement outcomes
 input_vocab_size = target_vocab_size
 dropout_rate = 0.0
 
-MAX_LENGTH = 20 # number of qubits
+MAX_LENGTH = Nqubits  # number of qubits
 
 povm_='4Pauli'
 
@@ -333,7 +337,7 @@ EPOCHS = 40
 
 j_init = 0
 
-Ndataset = 2000000 # for training each model
+#Ndataset = 2000000 # for training each model
 
 Nbatch_sample = 100000 # size of the batch when I call the sampling
 
