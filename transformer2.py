@@ -317,7 +317,7 @@ bias = povm.getinitialbias("+")
 
 EPOCHS = 40
 
-j_init = 0
+j_init = 1
 
 #Ndataset = 2000000 # for training each model
 
@@ -442,6 +442,17 @@ def train_step(flip,co,gtype,Ns):
 if not os.path.exists("samples"):
     os.makedirs("samples")
 
+checkpoint_path = "checkpoints/cp.ckpt"
+if not os.path.exists("checkpoints"):
+    os.makedirs("checkpoints")
+    
+if j_init == 0:
+    print("start from scratch") 
+else:
+    transformer.load_weights('./checkpoints/model_'+str(j_init-1)+'.ckpt')
+    print("Model restored.")
+
+
 for j in range(j_init,MAX_LENGTH-1):
 
     sites=[j,j+1] # on which sites to apply the gate
@@ -489,7 +500,8 @@ for j in range(j_init,MAX_LENGTH-1):
                 Ns = tf.shape(batch)[0]
                 l = train_step(flip,co,gtype,Ns)
 
-
+    transformer.save_weights('./checkpoints/model_'+str(j)+'.ckpt') 
+ 
 print("training done",flush=True)
 
 if Ndataset_eval != 0:
@@ -508,8 +520,8 @@ np.savetxt('./samples/samplex.txt',samples+1,fmt='%i')
 np.savetxt('./samples/logP.txt',lP)
 
 # classical fidelity
-cFid, cFidError, KL, KLError = mps.cFidelity(tf.cast(samples,dtype=tf.int64),lP)
+#cFid, cFidError, KL, KLError = mps.cFidelity(tf.cast(samples,dtype=tf.int64),lP)
 #Fid, FidErrorr = mps.Fidelity(tf.cast(samples,dtype=tf.int64))
 #stabilizers,sError = mps.stabilizers_samples(tf.cast(samples,dtype=tf.int64))
-print(cFid, cFidError,KL, KLError)
+#print(cFid, cFidError,KL, KLError)
 #print(stabilizers,sError,np.mean(stabilizers),np.mean(sError))
