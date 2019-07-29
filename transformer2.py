@@ -80,9 +80,9 @@ def scaled_dot_product_attention(q, k, v, mask):
   # softmax is normalized on the last axis (seq_len_k) so that the scores
   # add up to 1.
   attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)  # (..., seq_len_q, seq_len_k)
-  #print(attention_weights.shape,attention_weights)
+  
   output = tf.matmul(attention_weights, v)  # (..., seq_len_q, depth_v)
-  #print("output word 1",output[:,:,0,:])
+ 
   return output, attention_weights
 
 
@@ -101,7 +101,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
     self.wv = tf.keras.layers.Dense(d_model)
     
     self.dense = tf.keras.layers.Dense(d_model)
-    #print(self.depth,"depth")
+
         
   def split_heads(self, x, batch_size):
     """Split the last dimension into (num_heads, depth).
@@ -126,8 +126,8 @@ class MultiHeadAttention(tf.keras.layers.Layer):
     # attention_weights.shape == (batch_size, num_heads, seq_len_q, seq_len_k)
     scaled_attention, attention_weights = scaled_dot_product_attention(
         q, k, v, mask)
-    #print("scaled_attention w1",scaled_attention[:,:,0,:])   
-    #print("scaled_attention w2",scaled_attention[:,:,1,:])
+
+
     scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])  # (batch_size, seq_len_q, num_heads, depth)
     
     concat_attention = tf.reshape(scaled_attention, 
@@ -150,19 +150,15 @@ class DecoderLayer(tf.keras.layers.Layer):
     super(DecoderLayer, self).__init__()
 
     self.mha1 = MultiHeadAttention(d_model, num_heads)
-    self.mha2 = MultiHeadAttention(d_model, num_heads)
 
     self.ffn = point_wise_feed_forward_network(d_model, dff)
  
     self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-    #self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+
     self.layernorm3 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-    #self.layernorm1 = tf.keras.layers.experimental.LayerNormalization(epsilon=1e-6)
-    #self.layernorm2 = tf.keras.layers.experimental.LayerNormalization(epsilon=1e-6)
-    #self.layernorm3 = tf.keras.layers.experimental.LayerNormalization(epsilon=1e-6) 
-    
+
     self.dropout1 = tf.keras.layers.Dropout(rate)
-    #self.dropout2 = tf.keras.layers.Dropout(rate)
+
     self.dropout3 = tf.keras.layers.Dropout(rate)
     
     
@@ -171,35 +167,24 @@ class DecoderLayer(tf.keras.layers.Layer):
     # enc_output.shape == (batch_size, input_seq_len, d_model)
 
     attn1, attn_weights_block1 = self.mha1(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, d_model)
-    #print(attn1.shape,attn1[:,0,:],"attn1 first word")
-    #print(attn1.shape,attn1[:,1,:],"attn1 second word") 
     attn1 = self.dropout1(attn1, training=training)
-    #print(attn1.shape,attn1[:,0,:],"attn1 first word dropout")
-    #print(attn1.shape,attn1[:,1,:],"attn1 second word dropout")
-    #out1 = self.layernorm1(attn1 + x)
+ 
+
     out1 = attn1 + x
     s = tf.shape(out1)
     out1 = tf.reshape(out1,[s[0]*s[1],s[2]])
     out1 = self.layernorm1(out1)
     out1 = tf.reshape(out1,[s[0],s[1],s[2]]) 
-    #print("out1 w1",out1[:,0,:],"out1 w2",out1[:,1,:]) 
-    #attn2, attn_weights_block2 = self.mha2(
-    #    enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, d_model)
-    #attn2 = self.dropout2(attn2, training=training)
-    #out2 = self.layernorm2(attn2 + out1)  # (batch_size, target_seq_len, d_model)
     
     ffn_output = self.ffn(out1)  # (batch_size, target_seq_len, d_model)
-    #print("ffn_output word 1",ffn_output[:,0,:])
-    #print("ffn_output word 2",ffn_output[:,1,:])  
     ffn_output = self.dropout3(ffn_output, training=training)
-    #out3 = self.layernorm3(ffn_output + out1)  # (batch_size, target_seq_len, d_model)
+   
     out3 = ffn_output + out1
     s = tf.shape(out3)
     out3 = tf.reshape(out3,[s[0]*s[1],s[2]])
     out3 = self.layernorm1(out3)
     out3 = tf.reshape(out3,[s[0],s[1],s[2]]) 
-    #out3 = self.layernorm3(ffn_output)
-     
+  
     return out3, attn_weights_block1
 
 
@@ -259,8 +244,6 @@ class Transformer(tf.keras.Model):
   def call(self, tar, training, 
            look_ahead_mask):
 
-    #enc_output = self.encoder(inp, training, enc_padding_mask)  # (batch_size, inp_seq_len, d_model)
-    
     # dec_output.shape == (batch_size, tar_seq_len, d_model)
     dec_output, attention_weights = self.decoder(
         tar, training, look_ahead_mask)
@@ -362,7 +345,6 @@ def sample(Nsamples=1000):
   logP = tf.zeros([Nsamples,1])
 
   for i in range(MAX_LENGTH):
-    #print("conditional sampling at site", i)
     combined_mask = create_masks(output)
 
     # predictions.shape == (batch_size, seq_len, vocab_size)
@@ -373,7 +355,6 @@ def sample(Nsamples=1000):
     #    logP = tf.math.log(tf.nn.softmax(predictions,axis=2)+1e-10) # to compute the logP of the sampled config after sampling
 
     predictions = predictions[: ,-1:, :]  # (batch_size, 1, vocab_size) # select  # select the last word from the     seq_len dimension
-
     predictions = tf.reshape(predictions,[-1,target_vocab_size])  # (batch_size, 1, vocab_size)
 
     predicted_id = tf.random.categorical(predictions,1) # sample the conditional distribution
@@ -389,18 +370,15 @@ def sample(Nsamples=1000):
     output = tf.concat([output, tf.cast(predicted_id,dtype=tf.float32)], axis=1)
 
   output = tf.slice(output, [0, 1], [-1, -1]) # Cut the input of the initial call (zeros)
-
   oh = tf.one_hot(tf.cast(output,dtype=tf.int64),target_vocab_size) # one hot vector of the sample
 
   #logP = tf.reduce_sum(logP*oh,[1,2]) # the log probability of the configuration
-  #print(logP)
   return output,logP #, attention_weights
 
 
 def logP(config,training=False):
 
   Nsamples =  tf.shape(config)[0]
-  #encoder_input = tf.ones([Nsamples,MAX_LENGTH,d_model]) #(inp should be? bsize, sequence_length, d_model)
   init  = tf.zeros([Nsamples,1])
   output = tf.concat([init,tf.cast(config,dtype=tf.float32)],axis=1)
   output = output[:,0:MAX_LENGTH]
@@ -411,9 +389,7 @@ def logP(config,training=False):
   predictions, attention_weights = transformer(output,training,combined_mask)
 
   # predictions (Nsamples/b_size, MAX_LENGTH,vocab_size)
-  # print(predictions)
   logP = tf.math.log(tf.nn.softmax(predictions,axis=2)+1e-10)
-  #print(logP[:,0,:],logP.shape,"config+0",output)
   oh = tf.one_hot(config,target_vocab_size)
   logP = tf.reduce_sum(logP*oh,[1,2])
 
@@ -440,17 +416,12 @@ def flip2_tf(S,O,K,site):
     Coef = tf.boolean_mask(Coef,mask)
     flipped = tf.boolean_mask(flipped,mask)
     
-    ## transform samples to one hot vector
-    #flipped = tf.one_hot(tf.cast(flipped,tf.int32),depth=K)
-    #flipped = tf.reshape(flipped,[tf.shape(flipped)[0],tf.shape(flipped)[1]*tf.shape(flipped)[2]])
     return flipped,Coef #,indices
 
 
 def loss_function(flip,co,gtype,Ns):
-    #f = tf.cond(tf.equal(gtype,1), lambda: target_vocab_size, lambda: target_vocab_size**2)
     c = tf.cast(flip, dtype=tf.int64)
     lnP = logP(c,training=True)
-    #oh =  tf.one_hot(tf.cast(flip,tf.int32),depth=target_vocab_size)
     co = tf.cast(co,dtype = tf.float32)
     loss = -(1.0/tf.cast(Ns,tf.float32))*tf.reduce_sum(co * lnP)
     return loss
@@ -462,7 +433,6 @@ def train_step(flip,co,gtype,Ns):
         loss = loss_function(flip,co,gtype,Ns)
 
     gradients = tape.gradient(loss, transformer.trainable_variables)
-    #print(gradients)
     optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
 
 
@@ -520,19 +490,9 @@ for j in range(j_init,MAX_LENGTH-1):
                 Ns = tf.shape(batch)[0]
                 l = train_step(flip,co,gtype,Ns)
 
-                #samp,llpp = sample(100000) # get samples from the mode
-
-                #np.savetxt('./samples/samplex_'+str(epoch)+'_iteration_'+str(idx)+'.txt',samp+1,fmt='%i')
-                #np.savetxt('./samples/logP_'+str(epoch)+'_iteration_'+str(idx)+'.txt',llpp)                 
-                #cFid, cFidError, KL, KLError = mps.cFidelity(tf.cast(samp,dtype=tf.int64),llpp)
-
-                #print(epoch,idx,l)
-                #a = (np.array(list(it.product(range(4), repeat = 2)),dtype=np.uint8))
-                #l = np.sum(np.exp(logP(a)  ))
-                #print("prob",l)
 
 print("training done",flush=True)
-#samples,lnP = sample(Ndataset)
+
 if Ndataset_eval != 0:
     Ncalls = Ndataset /Nbatch_sample
     samples,lP = sample(Nbatch_sample) # get samples from the model
