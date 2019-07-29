@@ -485,6 +485,8 @@ for j in range(j_init,MAX_LENGTH-1):
             samples = np.vstack((samples,sa))
             llpp =np.reshape(llpp,[-1,1])
             lP =  np.vstack((lP,llpp))
+        samples = samples[0:Ndataset,:] 
+        lP = lP[0:Ndataset]     
 
     gtype = 2 # 2-qubit gate
 
@@ -537,7 +539,8 @@ if Ndataset_eval != 0:
         samples = np.vstack((samples,sa))
         llpp =np.reshape(llpp,[-1,1])
         lP =  np.vstack((lP,llpp))
-
+    
+    
 np.savetxt('./samples/samplex.txt',samples+1,fmt='%i')
 np.savetxt('./samples/logP.txt',lP)
 
