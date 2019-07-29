@@ -291,7 +291,7 @@ Nqubits = int(sys.argv[1])
 
 Ndataset = int(sys.argv[2])
 
-
+j_init = int(sys.argv[3])
 
 num_layers = 2 #4
 d_model = 32 #128 #128
@@ -317,7 +317,7 @@ bias = povm.getinitialbias("+")
 
 EPOCHS = 40
 
-j_init = 1
+#j_init = 0
 
 #Ndataset = 2000000 # for training each model
 
