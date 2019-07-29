@@ -3,7 +3,6 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import tensorflow as tf
 import time
 import numpy as np
-import matplotlib.pyplot as plt
 from POVM import POVM
 import itertools as it
 import slicetf
