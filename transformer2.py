@@ -9,7 +9,7 @@ import slicetf
 from MPS import MPS
 import sys
 import os
-
+from time import time
 
 
 def get_angles(pos, i, d_model):
@@ -293,9 +293,9 @@ Ndataset = int(sys.argv[2])
 
 j_init = int(sys.argv[3])
 
-num_layers = 2 #4
-d_model = 32 #128 #128
-dff = 32 # 128 # 512
+num_layers = 1 #4
+d_model = 16 #128 #128
+dff = 16 # 128 # 512
 num_heads = 4 # 8
 
 
@@ -315,13 +315,13 @@ mps = MPS(POVM=povm_,Number_qubits=MAX_LENGTH,MPS="Graph")
 
 bias = povm.getinitialbias("+")
 
-EPOCHS = 40
+EPOCHS = 4
 
 #j_init = 0
 
 #Ndataset = 2000000 # for training each model
 
-Nbatch_sample = 100000 # size of the batch when I call the sampling
+Nbatch_sample = 200000 # size of the batch when I call the sampling
 
 Ndataset_eval = 200000 # # number of samples to evaluate the model at the end 
 
@@ -334,9 +334,9 @@ learning_rate = CustomSchedule(d_model)
 #optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98, 
 #                                     epsilon=1e-9)
 
-optimizer = tf.keras.optimizers.Adam(lr=0.0001, beta_1=0.9, beta_2=0.98,
+optimizer = tf.keras.optimizers.Adam(lr=0.001, beta_1=0.9, beta_2=0.98,
                                      epsilon=1e-9)
-
+@tf.function
 def sample(Nsamples=1000):
 
   #encoder_input = tf.ones([Nsamples,MAX_LENGTH,d_model]) #(inp should be? bsize, sequence_length, d_model)
@@ -349,29 +349,29 @@ def sample(Nsamples=1000):
     # predictions.shape == (batch_size, seq_len, vocab_size)
     predictions, attention_weights = transformer(output, # self, tar, training,look_ahead_mask
                                                  False,
-                                                 None)
-    #if i == MAX_LENGTH-1:
-    #    logP = tf.math.log(tf.nn.softmax(predictions,axis=2)+1e-10) # to compute the logP of the sampled config after sampling
+                                                 combined_mask)
+    if i == MAX_LENGTH-1:
+        logP = tf.math.log(tf.nn.softmax(predictions,axis=2)+1e-10) # to compute the logP of the sampled config after sampling
 
     predictions = predictions[: ,-1:, :]  # (batch_size, 1, vocab_size) # select  # select the last word from the     seq_len dimension
     predictions = tf.reshape(predictions,[-1,target_vocab_size])  # (batch_size, 1, vocab_size)
 
     predicted_id = tf.random.categorical(predictions,1) # sample the conditional distribution
 
-    lp = tf.math.log(tf.nn.softmax(predictions,axis=1)+1e-10)
+    #lp = tf.math.log(tf.nn.softmax(predictions,axis=1)+1e-10)
 
-    ohot = tf.reshape(tf.one_hot(predicted_id,target_vocab_size),[-1,target_vocab_size])
+    #ohot = tf.reshape(tf.one_hot(predicted_id,target_vocab_size),[-1,target_vocab_size])
     
-    preclp = tf.reshape(tf.reduce_sum(ohot*lp,[1]),[-1,1])
+    #preclp = tf.reshape(tf.reduce_sum(ohot*lp,[1]),[-1,1])
    
-    logP = logP + preclp
+    #logP = logP + preclp
 
     output = tf.concat([output, tf.cast(predicted_id,dtype=tf.float32)], axis=1)
 
   output = tf.slice(output, [0, 1], [-1, -1]) # Cut the input of the initial call (zeros)
   oh = tf.one_hot(tf.cast(output,dtype=tf.int64),target_vocab_size) # one hot vector of the sample
 
-  #logP = tf.reduce_sum(logP*oh,[1,2]) # the log probability of the configuration
+  logP = tf.reduce_sum(logP*oh,[1,2]) # the log probability of the configuration
   return output,logP #, attention_weights
 
 
@@ -394,7 +394,7 @@ def logP(config,training=False):
 
   return logP #, attention_weights
 
-
+@tf.function
 def flip2_tf(S,O,K,site):
     Ns = tf.shape(S)[0]
     N  = tf.shape(S)[1]
@@ -458,19 +458,24 @@ for j in range(j_init,MAX_LENGTH-1):
     sites=[j,j+1] # on which sites to apply the gate
     gate = povm.p_two_qubit[1] # CZ gate
 
-    
+    print("generating samples")
+    start_time = time()    
     if Ndataset != 0:
         Ncalls = Ndataset /Nbatch_sample
         samples,lP = sample(Nbatch_sample) # get samples from the model
-        lP = np.reshape(lP,[-1,1])
+        lP = tf.reshape(lP,[-1,1])
 
-        for k in range(int(Ncalls)):
+        for k in range(int(Ncalls)-1):
             sa,llpp = sample(Nbatch_sample)
             samples = np.vstack((samples,sa))
-            llpp =np.reshape(llpp,[-1,1])
+            llpp = np.reshape(llpp,[-1,1])
             lP =  np.vstack((lP,llpp))
         samples = samples[0:Ndataset,:] 
-        lP = lP[0:Ndataset]     
+        lP = lP[0:Ndataset]  
+        print(lP.shape) 
+
+    end_time = time()
+    print("Collecting {:,} samples takes {} seconds".format(Ndataset, end_time - start_time))       
 
     gtype = 2 # 2-qubit gate
 
@@ -485,6 +490,7 @@ for j in range(j_init,MAX_LENGTH-1):
     for epoch in range(EPOCHS):
 
             print("epoch", epoch,"out of ", EPOCHS,"site", j,flush=True)
+            start_time = time()
             for idx in range(nsteps):
 
                 if bcount*batch_size + batch_size>=Ndataset:
@@ -499,7 +505,8 @@ for j in range(j_init,MAX_LENGTH-1):
 
                 Ns = tf.shape(batch)[0]
                 l = train_step(flip,co,gtype,Ns)
-
+            end_time = time()          
+            print("epoch {:,} takes {} seconds".format(epoch, end_time - start_time))   
     transformer.save_weights('./checkpoints/model_'+str(j)+'.ckpt') 
  
 print("training done",flush=True)
