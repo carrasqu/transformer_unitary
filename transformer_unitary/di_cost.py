@@ -1,0 +1,599 @@
+from __future__ import absolute_import, division, print_function, unicode_literals
+
+import tensorflow as tf
+import time
+import numpy as np
+from POVM import POVM
+import itertools as it
+import slicetf
+from MPS import MPS
+import sys
+import os
+from time import time
+
+
+def get_angles(pos, i, d_model):
+  angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
+  return pos * angle_rates
+
+def positional_encoding(position, d_model):
+  angle_rads = get_angles(np.arange(position)[:, np.newaxis],
+                          np.arange(d_model)[np.newaxis, :],
+                          d_model)
+  
+  # apply sin to even indices in the array; 2i
+  sines = np.sin(angle_rads[:, 0::2])
+  
+  # apply cos to odd indices in the array; 2i+1
+  cosines = np.cos(angle_rads[:, 1::2])
+  
+  pos_encoding = np.concatenate([sines, cosines], axis=-1)
+  
+  pos_encoding = pos_encoding[np.newaxis, ...]
+    
+  return tf.cast(pos_encoding, dtype=tf.float32)
+
+def create_padding_mask(seq):
+  seq = tf.cast(tf.math.equal(seq, -1), tf.float32)
+  
+  # add extra dimensions so that we can add the padding
+  # to the attention logits.
+  return seq[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
+
+def create_look_ahead_mask(size):
+  mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+  return mask  # (seq_len, seq_len)
+
+
+def scaled_dot_product_attention(q, k, v, mask):
+  """Calculate the attention weights.
+  q, k, v must have matching leading dimensions.
+  k, v must have matching penultimate dimension, i.e.: seq_len_k = seq_len_v.
+  The mask has different shapes depending on its type(padding or look ahead) 
+  but it must be broadcastable for addition.
+  
+  Args:
+    q: query shape == (..., seq_len_q, depth)
+    k: key shape == (..., seq_len_k, depth)
+    v: value shape == (..., seq_len_v, depth_v)
+    mask: Float tensor with shape broadcastable 
+          to (..., seq_len_q, seq_len_k). Defaults to None.
+    
+  Returns:
+    output, attention_weights
+  """
+
+  matmul_qk = tf.matmul(q, k, transpose_b=True)  # (..., seq_len_q, seq_len_k)
+  
+  # scale matmul_qk
+  dk = tf.cast(tf.shape(k)[-1], tf.float32)
+  
+  scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+
+  # add the mask to the scaled tensor.
+
+  if mask is not None:
+    #print(scaled_attention_logits.shape,mask.shape) 
+    scaled_attention_logits += (mask * -1e9)  
+    
+  # softmax is normalized on the last axis (seq_len_k) so that the scores
+  # add up to 1.
+  attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)  # (..., seq_len_q, seq_len_k)
+  
+  output = tf.matmul(attention_weights, v)  # (..., seq_len_q, depth_v)
+ 
+  return output, attention_weights
+
+
+class MultiHeadAttention(tf.keras.layers.Layer):
+  def __init__(self, d_model, num_heads):
+    super(MultiHeadAttention, self).__init__()
+    self.num_heads = num_heads
+    self.d_model = d_model
+    
+    assert d_model % self.num_heads == 0
+    
+    self.depth = d_model // self.num_heads
+    
+    self.wq = tf.keras.layers.Dense(d_model)
+    self.wk = tf.keras.layers.Dense(d_model)
+    self.wv = tf.keras.layers.Dense(d_model)
+    
+    self.dense = tf.keras.layers.Dense(d_model)
+
+        
+  def split_heads(self, x, batch_size):
+    """Split the last dimension into (num_heads, depth).
+    Transpose the result such that the shape is (batch_size, num_heads, seq_len, depth)
+    """
+    x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
+    return tf.transpose(x, perm=[0, 2, 1, 3])
+    
+  def call(self, v, k, q, mask):
+    batch_size = tf.shape(q)[0]
+    
+    q = self.wq(q)  # (batch_size, seq_len, d_model)
+    k = self.wk(k)  # (batch_size, seq_len, d_model)
+    v = self.wv(v)  # (batch_size, seq_len, d_model)
+    
+    q = self.split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
+    k = self.split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
+    v = self.split_heads(v, batch_size)  # (batch_size, num_heads, seq_len_v, depth)
+    #print(q.shape,k.shape,v.shape,"shapes??") 
+    
+    # scaled_attention.shape == (batch_size, num_heads, seq_len_q, depth)
+    # attention_weights.shape == (batch_size, num_heads, seq_len_q, seq_len_k)
+    scaled_attention, attention_weights = scaled_dot_product_attention(
+        q, k, v, mask)
+
+
+    scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])  # (batch_size, seq_len_q, num_heads, depth)
+    
+    concat_attention = tf.reshape(scaled_attention, 
+                                  (batch_size, -1, self.d_model))  # (batch_size, seq_len_q, d_model)
+
+    output = self.dense(concat_attention)  # (batch_size, seq_len_q, d_model)
+    #print("outputMHA1",output.shape, "w1", output[:,0,:],"w2", output[:,1,:])
+        
+    return output, attention_weights
+
+def point_wise_feed_forward_network(d_model, dff):
+  return tf.keras.Sequential([
+      tf.keras.layers.Dense(dff, activation='relu'),  # (batch_size, seq_len, dff)
+      tf.keras.layers.Dense(d_model)  # (batch_size, seq_len, d_model)
+  ])
+
+
+class DecoderLayer(tf.keras.layers.Layer):
+  def __init__(self, d_model, num_heads, dff, rate=0.1):
+    super(DecoderLayer, self).__init__()
+
+    self.mha1 = MultiHeadAttention(d_model, num_heads)
+
+    self.ffn = point_wise_feed_forward_network(d_model, dff)
+ 
+    self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+
+    self.layernorm3 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+
+    self.dropout1 = tf.keras.layers.Dropout(rate)
+
+    self.dropout3 = tf.keras.layers.Dropout(rate)
+    
+    
+  def call(self, x, training, 
+           look_ahead_mask):
+    # enc_output.shape == (batch_size, input_seq_len, d_model)
+
+    attn1, attn_weights_block1 = self.mha1(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, d_model)
+    attn1 = self.dropout1(attn1, training=training)
+ 
+
+    out1 = attn1 + x
+    s = tf.shape(out1)
+    out1 = tf.reshape(out1,[s[0]*s[1],s[2]])
+    out1 = self.layernorm1(out1)
+    out1 = tf.reshape(out1,[s[0],s[1],s[2]]) 
+    
+    ffn_output = self.ffn(out1)  # (batch_size, target_seq_len, d_model)
+    ffn_output = self.dropout3(ffn_output, training=training)
+   
+    out3 = ffn_output + out1
+    s = tf.shape(out3)
+    out3 = tf.reshape(out3,[s[0]*s[1],s[2]])
+    out3 = self.layernorm1(out3)
+    out3 = tf.reshape(out3,[s[0],s[1],s[2]]) 
+  
+    return out3, attn_weights_block1
+
+
+class Decoder(tf.keras.layers.Layer):
+  def __init__(self, num_layers, d_model, num_heads, dff, target_vocab_size, 
+               rate=0.1):
+    super(Decoder, self).__init__()
+
+    self.d_model = d_model
+    self.num_layers = num_layers
+    
+    self.embedding = tf.keras.layers.Embedding(target_vocab_size, d_model)
+    self.pos_encoding = positional_encoding(MAX_LENGTH, self.d_model)
+    
+    self.dec_layers = [DecoderLayer(d_model, num_heads, dff, rate) 
+                       for _ in range(num_layers)]
+    self.dropout = tf.keras.layers.Dropout(rate)
+    
+  def call(self, x, training, 
+           look_ahead_mask):
+
+    seq_len = tf.shape(x)[1]
+    attention_weights = {}
+    
+    x = self.embedding(x)  # (batch_size, target_seq_len, d_model)
+    x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+    x += self.pos_encoding[:, :seq_len, :]
+    
+    x = self.dropout(x, training=training)
+
+    for i in range(self.num_layers):
+      x, block1 = self.dec_layers[i](x,  training,
+                                             look_ahead_mask)
+      
+      attention_weights['decoder_layer{}_block1'.format(i+1)] = block1
+      #attention_weights['decoder_layer{}_block2'.format(i+1)] = block2
+    
+    # x.shape == (batch_size, target_seq_len, d_model)
+    return x, attention_weights
+
+
+class Transformer(tf.keras.Model):
+  def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, 
+               target_vocab_size, rate=0.1,bias='zeros'):
+    super(Transformer, self).__init__()
+
+    #self.encoder = Encoder(num_layers, d_model, num_heads, dff, 
+    #                       input_vocab_size, rate)
+
+    self.decoder = Decoder(num_layers, d_model, num_heads, dff, 
+                           target_vocab_size, rate)
+
+    #self.final_layer = tf.keras.layers.Dense(target_vocab_size)
+    bi = tf.constant_initializer(bias)
+    self.final_layer = tf.keras.layers.Dense(target_vocab_size,kernel_initializer='zeros',bias_initializer=bi) 
+    
+  def call(self, tar, training, 
+           look_ahead_mask):
+
+    # dec_output.shape == (batch_size, tar_seq_len, d_model)
+    dec_output, attention_weights = self.decoder(
+        tar, training, look_ahead_mask)
+    
+    final_output = self.final_layer(dec_output)  # (batch_size, tar_seq_len, target_vocab_size)
+    
+    return final_output, attention_weights
+
+
+
+class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+  def __init__(self, d_model, warmup_steps=4000):
+    super(CustomSchedule, self).__init__()
+    
+    self.d_model = d_model
+    self.d_model = tf.cast(self.d_model, tf.float32)
+
+    self.warmup_steps = warmup_steps
+    
+  def __call__(self, step):
+    arg1 = tf.math.rsqrt(step)
+    arg2 = step * (self.warmup_steps ** -1.5)
+    
+    return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+
+
+def create_masks( tar):
+  # Encoder padding mask
+  #enc_padding_mask = create_padding_mask(inp)
+
+  # Used in the 2nd attention block in the decoder.
+  # This padding mask is used to mask the encoder outputs.
+  #dec_padding_mask = create_padding_mask(inp)
+
+  # Used in the 1st attention block in the decoder.
+  # It is used to pad and mask future tokens in the input received by
+  # the decoder.
+  look_ahead_mask = create_look_ahead_mask(tf.shape(tar)[1])
+  dec_target_padding_mask = create_padding_mask(tar)
+  combined_mask = tf.maximum(dec_target_padding_mask, look_ahead_mask)
+
+  return combined_mask 
+
+
+Nqubits = int(sys.argv[1])
+
+Ndataset = int(sys.argv[2])
+
+j_init = int(sys.argv[3])
+
+num_layers = 1 #4
+d_model = 16 #128 #128
+dff = 16 # 128 # 512
+num_heads = 1 # 8
+
+
+batch_size = 100
+
+target_vocab_size = 4 # number of measurement outcomes
+input_vocab_size = target_vocab_size
+dropout_rate = 0.0
+
+MAX_LENGTH = Nqubits  # number of qubits
+
+povm_='4Pauli'
+
+povm = POVM(POVM=povm_, Number_qubits=MAX_LENGTH)
+
+mps = MPS(POVM=povm_,Number_qubits=MAX_LENGTH,MPS="Graph")
+
+bias = povm.getinitialbias("+")
+
+EPOCHS = 20
+
+#j_init = 0
+
+#Ndataset = 2000000 # for training each model
+
+Nbatch_sample = 10000 # size of the batch when I call the sampling
+
+Ndataset_eval = 1000 # # number of samples to evaluate the model at the end 
+
+transformer = Transformer(num_layers, d_model, num_heads, dff,
+                          input_vocab_size, target_vocab_size, dropout_rate,bias)
+
+
+learning_rate = CustomSchedule(d_model)
+
+#optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98, 
+#                                     epsilon=1e-9)
+
+optimizer = tf.keras.optimizers.Adam(lr=0.001, beta_1=0.9, beta_2=0.98,
+                                     epsilon=1e-9)
+@tf.function
+def sample(Nsamples=1000):
+
+  #encoder_input = tf.ones([Nsamples,MAX_LENGTH,d_model]) #(inp should be? bsize, sequence_length, d_model)
+  output = tf.zeros([Nsamples,1])
+  logP = tf.zeros([Nsamples,1])
+
+  for i in range(MAX_LENGTH):
+    combined_mask = create_masks(output)
+
+    # predictions.shape == (batch_size, seq_len, vocab_size)
+    predictions, attention_weights = transformer(output, # self, tar, training,look_ahead_mask
+                                                 False,
+                                                 combined_mask)
+    if i == MAX_LENGTH-1:
+        logP = tf.math.log(tf.nn.softmax(predictions,axis=2)+1e-10) # to compute the logP of the sampled config after sampling
+
+    predictions = predictions[: ,-1:, :]  # (batch_size, 1, vocab_size) # select  # select the last word from the     seq_len dimension
+    predictions = tf.reshape(predictions,[-1,target_vocab_size])  # (batch_size, 1, vocab_size)
+
+    predicted_id = tf.random.categorical(predictions,1) # sample the conditional distribution
+
+    #lp = tf.math.log(tf.nn.softmax(predictions,axis=1)+1e-10)
+
+    #ohot = tf.reshape(tf.one_hot(predicted_id,target_vocab_size),[-1,target_vocab_size])
+    
+    #preclp = tf.reshape(tf.reduce_sum(ohot*lp,[1]),[-1,1])
+   
+    #logP = logP + preclp
+
+    output = tf.concat([output, tf.cast(predicted_id,dtype=tf.float32)], axis=1)
+
+  output = tf.slice(output, [0, 1], [-1, -1]) # Cut the input of the initial call (zeros)
+  oh = tf.one_hot(tf.cast(output,dtype=tf.int64),target_vocab_size) # one hot vector of the sample
+
+  logP = tf.reduce_sum(logP*oh,[1,2]) # the log probability of the configuration
+  return output,logP #, attention_weights
+
+
+def logP(config,training=False):
+
+  Nsamples =  tf.shape(config)[0]
+  init  = tf.zeros([Nsamples,1])
+  output = tf.concat([init,tf.cast(config,dtype=tf.float32)],axis=1)
+  output = output[:,0:MAX_LENGTH]
+
+  combined_mask = create_masks(output)
+
+  # predictions.shape == (batch_size, seq_len, vocab_size) # self, tar, training,look_ahead_mask
+  predictions, attention_weights = transformer(output,training,combined_mask)
+
+  # predictions (Nsamples/b_size, MAX_LENGTH,vocab_size)
+  logP = tf.math.log(tf.nn.softmax(predictions,axis=2)+1e-10)
+  oh = tf.one_hot(config,target_vocab_size)
+  logP = tf.reduce_sum(logP*oh,[1,2])
+
+  return logP #, attention_weights
+
+@tf.function
+def flip2_tf(S,O,K,site):
+    Ns = tf.shape(S)[0]
+    N  = tf.shape(S)[1]
+    flipped = tf.reshape(tf.keras.backend.repeat(S, K**2),(Ns*K**2,N))
+    a = tf.constant(np.array(list(it.product(range(K), repeat = 2)),dtype=np.float32)) # possible combinations of outcomes on 2 qubits
+    s0 = flipped[:,site[0]]
+    s1 = flipped[:,site[1]]
+    a0 = tf.reshape(tf.tile(a[:,0],[Ns]),[-1])
+    a1 = tf.reshape(tf.tile(a[:,1],[Ns]),[-1])
+    flipped = slicetf.replace_slice_in(flipped)[:,site[0]].with_value(tf.reshape( a0 ,[K**2*Ns,1]))
+    flipped = slicetf.replace_slice_in(flipped)[:,site[1]].with_value(tf.reshape( a1 ,[K**2*Ns,1]))
+    a = tf.tile(a,[Ns,1])
+    indices_ = tf.cast(tf.concat([a,tf.reshape(s0,[tf.shape(s0)[0],1]),tf.reshape(s1,[tf.shape(s1)[0],1])],1),tf.int32)
+    ##getting the coefficients of the p-gates that accompany the flipped samples
+    Coef = tf.gather_nd(O,indices_)
+    # If some coefficients are zero, then eliminate those configurations (could be improved I believe)
+    mask = tf.where(np.abs(Coef)<1e-13,False,True)
+    Coef = tf.boolean_mask(Coef,mask)
+    flipped = tf.boolean_mask(flipped,mask)
+    
+    return flipped,Coef #,indices
+
+
+@tf.function
+def Pev(S,O,K,site):
+    Ns = tf.shape(S)[0]
+    N  = tf.shape(S)[1]
+    flipped = tf.reshape(tf.keras.backend.repeat(S, K**2),(Ns*K**2,N))
+    a = tf.constant(np.array(list(it.product(range(K), repeat = 2)),dtype=np.float32)) # possible combinations of outcomes on 2 qubits
+    s0 = flipped[:,site[0]]
+    s1 = flipped[:,site[1]]
+    a0 = tf.reshape(tf.tile(a[:,0],[Ns]),[-1])
+    a1 = tf.reshape(tf.tile(a[:,1],[Ns]),[-1])
+    flipped = slicetf.replace_slice_in(flipped)[:,site[0]].with_value(tf.reshape( a0 ,[K**2*Ns,1]))
+    flipped = slicetf.replace_slice_in(flipped)[:,site[1]].with_value(tf.reshape( a1 ,[K**2*Ns,1]))
+    a = tf.tile(a,[Ns,1])
+    #indices_ = tf.cast(tf.concat([a,tf.reshape(s0,[tf.shape(s0)[0],1]),tf.reshape(s1,[tf.shape(s1)[0],1])],1),tf.int32)
+    indices_ = tf.cast(tf.concat([tf.reshape(s0,[tf.shape(s0)[0],1]),tf.reshape(s1,[tf.shape(s1)[0],1]),a],1),tf.int32)  
+    #indices_ = tf.reverse(indices_,[1])
+    ##getting the coefficients of the p-gates that accompany the flipped samples
+    Coef = tf.gather_nd(O,indices_)
+    # If some coefficients are zero, then eliminate those configurations (could be improved I believe)
+    #mask = tf.where(np.abs(Coef)<1e-13,False,True)
+    #Coef = tf.boolean_mask(Coef,mask)
+    #flipped = tf.boolean_mask(flipped,mask)
+    lilP = logP(tf.cast(flipped,dtype=tf.int64),False)
+    Pu = tf.reduce_sum(tf.cast(tf.reshape(Coef,[Ns,K**2]),dtype=tf.float32)*tf.reshape(tf.exp(lilP),[Ns,K**2]),axis=1)
+    return Pu #,indices
+
+
+@tf.function
+def flip2_reverse_swift(S,O,K,site):
+  ## S: batch, O: gate, K: number of measurement outcomes, sites: [j,j+1]
+  ## S is not one-hot form
+    Ns = tf.shape(S)[0] ## batch size
+    N  = tf.shape(S)[1] ## Nqubit
+    flipped = tf.cast(tf.reshape(tf.keras.backend.repeat(S, K**2),(Ns*K**2,N)),tf.float32) ## repeat is to prepare K**2 outcome after O adds on, after reshape it has shape (batchsize * 16, Nqubit
+    a = tf.constant(np.array(list(it.product(range(K), repeat = 2)),dtype=np.float32)) # possible combinations of outcomes on 2 qubits ## it generates (0,0),(0,1),...,(3,3)
+    s0 = flipped[:,site[0]]
+    s1 = flipped[:,site[1]]
+    a0 = tf.reshape(tf.tile(a[:,0],[Ns]),[-1]) ## tf.tile repeasts tensor Ns times
+    a1 = tf.reshape(tf.tile(a[:,1],[Ns]),[-1])
+    ## flipped has shape (batch, Nqubit), this function is to replace flipped[batch, site0], flipped[batch, site1] with a0, a1 values
+    flipped = slicetf.replace_slice_in(flipped)[:,site[0]].with_value(tf.reshape( a0 ,[K**2*Ns,1]))
+    flipped = slicetf.replace_slice_in(flipped)[:,site[1]].with_value(tf.reshape( a1 ,[K**2*Ns,1]))
+    a = tf.tile(a,[Ns,1])
+    indices_ = tf.cast(tf.concat([tf.reshape(s0,[tf.shape(s0)[0],1]),tf.reshape(s1,[tf.shape(s1)[0],1]),a],1),tf.int32)
+    ##getting the coefficients of the p-gates that accompany the flipped samples ## (Nq,Nq,Nq,Nq) shape for index
+    Coef = tf.gather_nd(O,indices_) ## O has to be tensor form
+    #lilP = logP(tf.cast(flipped,dtype=tf.int64),False)
+    #Pu = tf.reduce_sum(tf.cast(tf.reshape(Coef,[Ns,K**2]),dtype=tf.float32)*tf.reshape(tf.exp(lilP),[Ns,K**2]),axis=1) 
+    return flipped,Coef #,indices
+
+def loss_function(aa,Pu,P): 
+    c = tf.cast(aa, dtype=tf.int64)
+    lnPa = logP(c,training=True)
+    #co = tf.cast(co,dtype = tf.float32)
+    #print(Pu.shape,P.shape,lnP.shape)  
+    loss = -tf.reduce_mean(Pu/P * lnPa)
+    return loss
+
+@tf.function
+def train_step(batch,batchPu,batchP):
+
+    with tf.GradientTape() as tape:
+        loss = loss_function(batch,batchPu,batchP)
+
+    gradients = tape.gradient(loss, transformer.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
+
+
+    return loss
+
+#sys.exit(0)
+
+if not os.path.exists("samples"):
+    os.makedirs("samples")
+
+checkpoint_path = "checkpoints/cp.ckpt"
+if not os.path.exists("checkpoints"):
+    os.makedirs("checkpoints")
+    
+if j_init == 0:
+    print("start from scratch") 
+else:
+    transformer.load_weights('./checkpoints/model_'+str(j_init-1)+'.ckpt')
+    print("Model restored.")
+
+
+for j in range(j_init,MAX_LENGTH-1):
+
+    sites=[j,j+1] # on which sites to apply the gate
+    gate = povm.p_two_qubit[1] # CZ gate
+
+    print("generating samples")
+    start_time = time()    
+    if Ndataset != 0:
+        Ncalls = Ndataset /Nbatch_sample
+        samples,lP = sample(Nbatch_sample) # get samples from the model
+        lP = tf.reshape(lP,[-1,1])
+
+        for k in range(int(Ncalls)-1):
+            sa,llpp = sample(Nbatch_sample)
+            samples = np.vstack((samples,sa))
+            llpp = np.reshape(llpp,[-1,1])
+            lP =  np.vstack((lP,llpp))
+        samples = samples[0:Ndataset,:] 
+        lP = lP[0:Ndataset]  
+        
+
+    end_time = time()
+    print("Collecting {:,} samples takes {} seconds".format(Ndataset, end_time - start_time))       
+
+    gtype = 2 # 2-qubit gate
+
+    nsteps = int(samples.shape[0]/batch_size)
+    bcount = 0
+    counter= 0
+    samples = tf.stop_gradient(samples)
+    lP = tf.stop_gradient(lP)
+    Pu = Pev(samples,gate,target_vocab_size,sites)
+    #fp,coef = flip2_reverse_swift(samples,gate,target_vocab_size,sites)
+    #fp = tf.cast(fp, dtype=tf.uint8) # c are configurations
+    #P = tf.exp(logP(fp,False))
+    #Pu = tf.reshape(tf.cast(tf.math.real(coef),dtype=tf.float32)*P,(Ndataset,target_vocab_size**2))
+    #Pu = tf.reduce_sum(Pu, axis=1)
+    #Pu = np.reshape(Pu,[-1,1])
+    Pu = tf.reshape(Pu,[-1,1])
+    #print(Pu,Pu1) 
+    #ept = tf.random.shuffle(samples)
+    ept = samples 
+    
+
+    for epoch in range(EPOCHS):
+
+            print("epoch", epoch,"out of ", EPOCHS,"site", j,flush=True)
+            start_time = time()
+            for idx in range(nsteps):
+
+                if bcount*batch_size + batch_size>=Ndataset:
+                    bcount=0
+                    #ept = tf.random.shuffle(samples)
+
+                batch = ept[ bcount*batch_size: bcount*batch_size+batch_size,:]
+                batchPu = Pu[bcount*batch_size: bcount*batch_size+batch_size,0 ]
+                batchP  = tf.exp(lP[bcount*batch_size: bcount*batch_size+batch_size,0])
+                bcount = bcount+1
+
+
+                #flip,co = flip2_tf(batch,gate,target_vocab_size,sites)
+
+                Ns = tf.shape(batch)[0]
+                
+                l = train_step(batch,batchPu,batchP)
+                
+            end_time = time()          
+            print("epoch {:,} takes {} seconds".format(epoch, end_time - start_time))   
+    transformer.save_weights('./checkpoints/model_'+str(j)+'.ckpt') 
+ 
+print("training done",flush=True)
+
+if Ndataset_eval != 0:
+    Ncalls = Ndataset /Nbatch_sample
+    samples,lP = sample(Nbatch_sample) # get samples from the model
+    lP = np.reshape(lP,[-1,1])
+
+    for k in range(int(Ncalls)):
+        sa,llpp = sample(Nbatch_sample)
+        samples = np.vstack((samples,sa))
+        llpp =np.reshape(llpp,[-1,1])
+        lP =  np.vstack((lP,llpp))
+    
+    
+np.savetxt('./samples/samplex.txt',samples+1,fmt='%i')
+np.savetxt('./samples/logP.txt',lP)
+
+# classical fidelity
+cFid, cFidError, KL, KLError = mps.cFidelity(tf.cast(samples,dtype=tf.int64),lP)
+Fid, FidErrorr = mps.Fidelity(tf.cast(samples,dtype=tf.int64))
+#stabilizers,sError = mps.stabilizers_samples(tf.cast(samples,dtype=tf.int64))
+print(cFid, cFidError,KL, KLError,Fid, FidErrorr)
+#print(stabilizers,sError,np.mean(stabilizers),np.mean(sError))
