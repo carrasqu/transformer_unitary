@@ -515,14 +515,21 @@ for j in range(j_init,MAX_LENGTH-1):
         Ncalls = Ndataset /Nbatch_sample
         samples,lP = sample(Nbatch_sample) # get samples from the model
         lP = tf.reshape(lP,[-1,1])
+        Pu = Pev(samples,gate,target_vocab_size,sites)
+        Pu = tf.reshape(Pu,[-1,1]) 
+         
 
         for k in range(int(Ncalls)-1):
             sa,llpp = sample(Nbatch_sample)
+            Pu_ =  Pev(sa,gate,target_vocab_size,sites) 
             samples = np.vstack((samples,sa))
             llpp = np.reshape(llpp,[-1,1])
+            Pu_ = np.reshape(Pu_,[-1,1])
             lP =  np.vstack((lP,llpp))
+            Pu =  np.vstack((Pu,Pu_))  
         samples = samples[0:Ndataset,:] 
-        lP = lP[0:Ndataset]  
+        lP = lP[0:Ndataset]
+        Pu = Pu[0:Ndataset]   
         
 
     end_time = time()
@@ -533,16 +540,16 @@ for j in range(j_init,MAX_LENGTH-1):
     nsteps = int(samples.shape[0]/batch_size)
     bcount = 0
     counter= 0
-    samples = tf.stop_gradient(samples)
-    lP = tf.stop_gradient(lP)
-    Pu = Pev(samples,gate,target_vocab_size,sites)
+    #samples = tf.stop_gradient(samples)
+    #lP = tf.stop_gradient(lP)
+    #Pu = Pev(samples,gate,target_vocab_size,sites)
     #fp,coef = flip2_reverse_swift(samples,gate,target_vocab_size,sites)
     #fp = tf.cast(fp, dtype=tf.uint8) # c are configurations
     #P = tf.exp(logP(fp,False))
     #Pu = tf.reshape(tf.cast(tf.math.real(coef),dtype=tf.float32)*P,(Ndataset,target_vocab_size**2))
     #Pu = tf.reduce_sum(Pu, axis=1)
     #Pu = np.reshape(Pu,[-1,1])
-    Pu = tf.reshape(Pu,[-1,1])
+    #Pu = tf.reshape(Pu,[-1,1])
     #print(Pu,Pu1) 
     #ept = tf.random.shuffle(samples)
     ept = samples 
